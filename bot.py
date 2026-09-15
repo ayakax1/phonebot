@@ -27,6 +27,7 @@ bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
 BOT_USERNAME = None  # заполняется при старте в main() через bot.get_me()
+BOT_ID = None  # заполняется при старте в main() через bot.get_me()
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -145,6 +146,12 @@ def display_username(user) -> str:
     return f"@{user.username}" if user.username else user.full_name
 
 
+def raw_username(user) -> str | None:
+    """Ник телеграма без '@', для сохранения в БД (используется поиском
+    по нику в трейдах). display_username() — для текста сообщений."""
+    return user.username
+
+
 def format_phone_card(
     *, username, model, status, rarity, base_price, delta, obtained_ts,
     added_note: bool, total_count: int | None = None,
@@ -188,7 +195,7 @@ def format_phone_card(
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject):
     user_id = message.from_user.id
-    await db.ensure_user(user_id, display_username(message.from_user))
+    await db.ensure_user(user_id, raw_username(message.from_user))
 
     if command.args and command.args.startswith("ref_"):
         try:
@@ -212,14 +219,16 @@ async def cmd_help(message: Message):
         "📱 Бот-фарм телефонов!\n\n"
         "Напиши слово «тел» (и только его) в этот чат или в группу, "
         "чтобы получить случайный телефон случайной редкости.\n"
-        f"Перезарядка: {format_seconds(config.COOLDOWN_SECONDS)}."
+        f"Перезарядка: {format_seconds(config.COOLDOWN_SECONDS)}.\n\n"
+        "Другие слова-команды: «инв», «апдейт», «мой акк», «ежедневка», "
+        "«топ», «трейд»."
     )
 
 
 @dp.message(Command("ref"))
 async def cmd_ref(message: Message):
     user_id = message.from_user.id
-    await db.ensure_user(user_id, display_username(message.from_user))
+    await db.ensure_user(user_id, raw_username(message.from_user))
     count = await db.get_referral_count(user_id)
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
     await message.answer(
@@ -340,7 +349,7 @@ async def cmd_profile(message: Message):
 async def show_profile(message: Message):
     user = message.from_user
     user_id = user.id
-    await db.ensure_user(user_id, display_username(user))
+    await db.ensure_user(user_id, raw_username(user))
 
     avatar_bytes = None
     try:
@@ -400,6 +409,90 @@ async def show_profile(message: Message):
     await message.answer_photo(photo, caption=caption)
 
 
+# ---------- ТРЕЙДЫ: перехват "голого" числа и реплая с юзернеймом ----------
+# Эти два хендлера должны стоять РАНЬШЕ handle_text_triggers по регистрации,
+# иначе aiogram отдаст текстовое сообщение туда первым и до трейда дело не
+# дойдёт. Если сообщение не подходит под текущий шаг трейда — SkipHandler,
+# чтобы обработка ушла дальше как обычно (например, дальше это может
+# оказаться просто "тел").
+
+TOP_LIMIT = 10
+
+
+def format_amount_short(n: int) -> str:
+    if abs(n) >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def top_entry_name(row) -> str:
+    return f"@{row['username']}" if row["username"] else f"id{row['user_id']}"
+
+
+@dp.message(Command("top"))
+async def cmd_top(message: Message):
+    await show_top(message)
+
+
+async def show_top(message: Message):
+    top_balance = await db.get_top_balance(TOP_LIMIT)
+    top_inventory = await db.get_top_inventory(TOP_LIMIT)
+
+    lines = ["💰 <b>Топ по балансу:</b>"]
+    if top_balance:
+        for i, row in enumerate(top_balance, start=1):
+            lines.append(f"{i}. {top_entry_name(row)} | {format_amount_short(row['balance'])}₽")
+    else:
+        lines.append("— пока никого —")
+
+    lines.append("")
+    lines.append("📦 <b>Топ по цене инвентаря:</b>")
+    if top_inventory:
+        for i, row in enumerate(top_inventory, start=1):
+            lines.append(
+                f"{i}. {top_entry_name(row)} | {format_amount_short(row['inventory_value'])}₽"
+            )
+    else:
+        lines.append("— пока никого —")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(F.text)
+async def handle_trade_number_input(message: Message):
+    if message.reply_to_message is not None:
+        raise SkipHandler
+
+    text = message.text.strip()
+    if not text.lstrip("-").isdigit():
+        raise SkipHandler
+
+    user_id = message.from_user.id
+    trade = await db.get_active_trade_for_user(user_id)
+    if trade is None or trade["awaiting_input"] not in ("rub", "meteor"):
+        raise SkipHandler
+
+    side = await get_trade_side_for_user(trade, user_id)
+    if side is None or not is_trade_building_side(trade, side):
+        raise SkipHandler
+
+    await apply_trade_currency_input(message, trade, side, int(text))
+
+
+@dp.message(F.text, F.reply_to_message)
+async def handle_trade_username_reply(message: Message):
+    if message.reply_to_message.from_user is None or message.reply_to_message.from_user.id != BOT_ID:
+        raise SkipHandler
+
+    user_id = message.from_user.id
+    trade = await db.get_active_trade_for_user(user_id)
+    if (trade is None or trade["status"] != "awaiting_recipient_username"
+            or trade["initiator_id"] != user_id):
+        raise SkipHandler
+
+    await apply_trade_recipient_username(message, trade)
+
+
 @dp.message(F.text)
 async def handle_text_triggers(message: Message):
     text = message.text.strip().lower()
@@ -425,12 +518,15 @@ async def handle_text_triggers(message: Message):
         await show_profile(message)
     elif text == "ежедневка":
         await handle_daily(message)
+    elif text == "трейд":
+        await handle_trade_start(message)
+    elif text == "топ":
+        await show_top(message)
 
 
 async def handle_tel_pull(message: Message):
     user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.full_name
-    await db.ensure_user(user_id, username)
+    await db.ensure_user(user_id, raw_username(message.from_user))
 
     remaining = await db.seconds_until_ready(user_id)
     if remaining > 0:
@@ -535,7 +631,7 @@ async def cmd_daily(message: Message):
 
 async def handle_daily(message: Message):
     user_id = message.from_user.id
-    await db.ensure_user(user_id, display_username(message.from_user))
+    await db.ensure_user(user_id, raw_username(message.from_user))
 
     current_day, last_claim = await db.get_daily_status(user_id)
     now = time.time()
@@ -970,7 +1066,7 @@ async def cmd_promo(message: Message):
     reward_type = promo["reward_type"]
     reward_value = promo["reward_value"]
 
-    await db.ensure_user(user_id, display_username(message.from_user))
+    await db.ensure_user(user_id, raw_username(message.from_user))
 
     if reward_type == "resetcd":
         remaining = await db.seconds_until_ready(user_id)
@@ -1094,6 +1190,571 @@ async def cb_promo_fix(callback: CallbackQuery):
     await callback.answer()
 
 
+# ---------- ТРЕЙДЫ ----------
+
+METEORITE_TRADE_WEIGHT = 25000  # столько же "веса", сколько стоит апгрейд
+TRADE_REPUTATION_DIVISOR = 50000  # средний вес трейда 50000 -> +1.00 репутации
+TRADE_MIN_RATIO = 2  # меньшая сторона не может весить меньше чем bigger/2
+
+
+def is_trade_building_side(trade, side: str) -> bool:
+    if side == "initiator":
+        return trade["status"] == "building_initiator"
+    return trade["status"] == "building_recipient"
+
+
+async def get_trade_side_for_user(trade, user_id: int) -> str | None:
+    if trade is None:
+        return None
+    if trade["initiator_id"] == user_id:
+        return "initiator"
+    if trade["recipient_id"] == user_id:
+        return "recipient"
+    return None
+
+
+def calc_trade_reputation(weight_a: int, weight_b: int) -> float:
+    avg_weight = (weight_a + weight_b) / 2
+    if avg_weight <= 0:
+        return 0.0
+    return max(0.01, round(avg_weight / TRADE_REPUTATION_DIVISOR, 2))
+
+
+async def trade_display_name(user_id: int) -> str:
+    row = await db.get_user(user_id)
+    if row and row["username"]:
+        return f"@{row['username']}"
+    return f"id{user_id}"
+
+
+async def calc_trade_side_weight(trade, side: str) -> int:
+    items = await db.get_trade_items_detailed(trade["id"], side)
+    items_weight = sum(i["price"] for i in items)
+    rub = trade["initiator_rub"] if side == "initiator" else trade["recipient_rub"]
+    met = trade["initiator_meteorites"] if side == "initiator" else trade["recipient_meteorites"]
+    return items_weight + rub + met * METEORITE_TRADE_WEIGHT
+
+
+async def build_trade_summary_text(trade, side: str) -> str:
+    items = await db.get_trade_items_detailed(trade["id"], side)
+    rub = trade["initiator_rub"] if side == "initiator" else trade["recipient_rub"]
+    met = trade["initiator_meteorites"] if side == "initiator" else trade["recipient_meteorites"]
+    weight = await calc_trade_side_weight(trade, side)
+
+    lines = ["🔄 <b>Ваше предложение в трейде</b>", ""]
+    if items:
+        for it in items:
+            emoji = RARITY_EMOJI.get(it["rarity"], "")
+            rank_tag = f" [{it['rank']}]" if it["rank"] else ""
+            lines.append(f"{emoji} {html.escape(it['model'])}{rank_tag} — {it['price']}₽")
+    else:
+        lines.append("— телефонов пока нет —")
+    lines.append("")
+    lines.append(f"💰 Рубли: {rub}₽")
+    lines.append(f"☄️ Метеориты: {met}")
+    lines.append(f"⚖️ Ваш вес предложения: {weight}")
+
+    other_side = "recipient" if side == "initiator" else "initiator"
+    other_id = trade["recipient_id"] if side == "initiator" else trade["initiator_id"]
+    if other_id is not None:
+        other_weight = await calc_trade_side_weight(trade, other_side)
+        other_name = await trade_display_name(other_id)
+        lines.append(f"⚖️ Вес {html.escape(other_name)}: {other_weight}")
+
+    return "\n".join(lines)
+
+
+def build_trade_keyboard(trade_id: int, side: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📱 Телефоны", callback_data=f"trade_items:{trade_id}")
+    kb.button(text="💰 Добавить рубли", callback_data=f"trade_addrub:{trade_id}")
+    kb.button(text="☄️ Добавить метеориты", callback_data=f"trade_addmet:{trade_id}")
+    if side == "initiator":
+        kb.button(text="➡️ Далее", callback_data=f"trade_next:{trade_id}")
+    else:
+        kb.button(text="✅ Подтвердить трейд", callback_data=f"trade_confirm:{trade_id}")
+    kb.button(text="❌ Отменить трейд", callback_data=f"trade_cancel:{trade_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def send_trade_menu_message(chat_id: int, trade, side: str):
+    text = await build_trade_summary_text(trade, side)
+    markup = build_trade_keyboard(trade["id"], side)
+    await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+async def edit_trade_menu(callback: CallbackQuery, trade, side: str):
+    text = await build_trade_summary_text(trade, side)
+    markup = build_trade_keyboard(trade["id"], side)
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def handle_trade_start(message: Message):
+    user_id = message.from_user.id
+    await db.ensure_user(user_id, raw_username(message.from_user))
+
+    existing = await db.get_active_trade_for_user(user_id)
+    if existing is not None:
+        await message.answer(
+            "❗У вас уже есть активный трейд. Отмените его командой /canceltrade, "
+            "если хотите начать новый."
+        )
+        return
+
+    rarities = await db.get_user_owned_rarities(user_id)
+    if not rarities:
+        await message.answer(
+            "В вашем инвентаре пока пусто — нечего предложить в трейд. "
+            "Напишите «тел», чтобы получить первый телефон!"
+        )
+        return
+
+    trade_id = await db.create_trade(user_id)
+    trade = await db.get_trade(trade_id)
+    await send_trade_menu_message(message.chat.id, trade, "initiator")
+
+
+@dp.message(Command("trade"))
+async def cmd_trade(message: Message):
+    await handle_trade_start(message)
+
+
+@dp.message(Command("canceltrade"))
+async def cmd_cancel_trade(message: Message):
+    user_id = message.from_user.id
+    trade = await db.get_active_trade_for_user(user_id)
+    if trade is None:
+        await message.answer("У вас нет активного трейда.")
+        return
+
+    await db.cancel_trade(trade["id"])
+    await message.answer("❌ Трейд отменён.")
+
+    other_id = trade["recipient_id"] if trade["initiator_id"] == user_id else trade["initiator_id"]
+    if other_id is not None:
+        try:
+            await bot.send_message(other_id, "❌ Собеседник отменил трейд.")
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить {other_id} об отмене трейда: {e}")
+
+
+@dp.callback_query(F.data.startswith("trade_items:"))
+async def cb_trade_items(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    rarities = await db.get_user_owned_rarities(callback.from_user.id)
+    if not rarities:
+        await callback.answer("В инвентаре пусто.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for rarity in config.RARITY_ORDER:
+        if rarity in rarities:
+            emoji = RARITY_EMOJI.get(rarity, "")
+            idx = config.RARITY_ORDER.index(rarity)
+            kb.button(
+                text=f"{emoji} {rarity} ({rarities[rarity]})",
+                callback_data=f"trade_rarity:{trade_id}:{idx}",
+            )
+    kb.button(text="⬅️ Назад к трейду", callback_data=f"trade_back:{trade_id}")
+    kb.adjust(1)
+    await callback.message.edit_text("📦 Выберите редкость:", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("trade_rarity:"))
+async def cb_trade_rarity(callback: CallbackQuery):
+    _, trade_id_str, idx_str = callback.data.split(":", 2)
+    trade_id = int(trade_id_str)
+    rarity = config.RARITY_ORDER[int(idx_str)]
+
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    await _render_trade_rarity_items(callback, trade_id, side, rarity)
+    await callback.answer()
+
+
+async def _render_trade_rarity_items(callback: CallbackQuery, trade_id: int, side: str, rarity: str):
+    items = await db.get_user_phones_by_rarity(callback.from_user.id, rarity)
+    if not items:
+        await callback.answer("Тут пусто", show_alert=True)
+        return
+
+    selected = await db.get_trade_item_up_ids(trade_id, side)
+    idx = config.RARITY_ORDER.index(rarity)
+
+    kb = InlineKeyboardBuilder()
+    for item in items:
+        mark = "✅ " if item["up_id"] in selected else ""
+        time_str = format_msk_time(item["obtained_at"], short=True)
+        rank_tag = f" [{item['rank']}]" if item["rank"] else ""
+        kb.button(
+            text=f"{mark}{item['model']} ({time_str}){rank_tag}",
+            callback_data=f"trade_toggle:{trade_id}:{item['up_id']}:{idx}",
+        )
+    kb.button(text="⬅️ Назад к редкостям", callback_data=f"trade_items:{trade_id}")
+    kb.adjust(1)
+
+    emoji = RARITY_EMOJI.get(rarity, "")
+    await callback.message.edit_text(
+        f"{emoji} {rarity} — нажмите на телефон, чтобы добавить/убрать его из трейда:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("trade_toggle:"))
+async def cb_trade_toggle(callback: CallbackQuery):
+    _, trade_id_str, up_id_str, idx_str = callback.data.split(":", 3)
+    trade_id = int(trade_id_str)
+    up_id = int(up_id_str)
+    rarity = config.RARITY_ORDER[int(idx_str)]
+
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    item = await db.get_user_phone_item(up_id)
+    if item is None or item["user_id"] != callback.from_user.id:
+        await callback.answer("Телефон не найден.", show_alert=True)
+        return
+
+    selected = await db.get_trade_item_up_ids(trade_id, side)
+    if up_id in selected:
+        await db.remove_trade_item(trade_id, side, up_id)
+        await callback.answer("Убрано из трейда")
+    else:
+        if await db.is_up_id_in_other_active_trade(up_id, trade_id):
+            await callback.answer("Этот телефон уже участвует в другом трейде.", show_alert=True)
+            return
+        await db.add_trade_item(trade_id, side, up_id)
+        await callback.answer("Добавлено в трейд")
+
+    await _render_trade_rarity_items(callback, trade_id, side, rarity)
+
+
+@dp.callback_query(F.data.startswith("trade_back:"))
+async def cb_trade_back(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+    await edit_trade_menu(callback, trade, side)
+    await callback.answer()
+
+
+async def _prompt_trade_currency(callback: CallbackQuery, kind: str):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    await db.set_trade_awaiting(trade_id, kind)
+    label = "рублей" if kind == "rub" else "метеоритов"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Отмена ввода", callback_data=f"trade_cancel_input:{trade_id}")
+    await callback.message.edit_text(
+        f"✏️ Напишите в чат число — сколько {label} добавить в трейд.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("trade_addrub:"))
+async def cb_trade_addrub(callback: CallbackQuery):
+    await _prompt_trade_currency(callback, "rub")
+
+
+@dp.callback_query(F.data.startswith("trade_addmet:"))
+async def cb_trade_addmet(callback: CallbackQuery):
+    await _prompt_trade_currency(callback, "meteor")
+
+
+@dp.callback_query(F.data.startswith("trade_cancel_input:"))
+async def cb_trade_cancel_input(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or not is_trade_building_side(trade, side):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    await db.set_trade_awaiting(trade_id, None)
+    trade = await db.get_trade(trade_id)
+    await edit_trade_menu(callback, trade, side)
+    await callback.answer()
+
+
+async def apply_trade_currency_input(message: Message, trade, side: str, amount: int):
+    if amount < 0:
+        await message.reply("Число должно быть неотрицательным.")
+        return
+
+    user_id = message.from_user.id
+    kind = trade["awaiting_input"]
+
+    if kind == "rub":
+        already = trade["initiator_rub"] if side == "initiator" else trade["recipient_rub"]
+        balance = await db.get_balance(user_id)
+        if already + amount > balance:
+            await message.reply(
+                f"Недостаточно рублей. На балансе {balance}₽, "
+                f"в трейде уже отложено {already}₽."
+            )
+            return
+        await db.add_trade_currency(trade["id"], side, rub=amount)
+        added_text = f"💰 Добавлено в трейд: {amount}₽"
+    else:
+        already = trade["initiator_meteorites"] if side == "initiator" else trade["recipient_meteorites"]
+        meteorites = await db.get_meteorites(user_id)
+        if already + amount > meteorites:
+            await message.reply(
+                f"Недостаточно метеоритов. У вас {meteorites}, "
+                f"в трейде уже отложено {already}."
+            )
+            return
+        await db.add_trade_currency(trade["id"], side, meteorites=amount)
+        added_text = f"☄️ Добавлено в трейд: {amount}"
+
+    await db.set_trade_awaiting(trade["id"], None)
+    trade = await db.get_trade(trade["id"])
+    await message.reply(added_text)
+    await send_trade_menu_message(message.chat.id, trade, side)
+
+
+@dp.callback_query(F.data.startswith("trade_next:"))
+async def cb_trade_next(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    if (trade is None or trade["initiator_id"] != callback.from_user.id
+            or trade["status"] != "building_initiator"):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    weight = await calc_trade_side_weight(trade, "initiator")
+    if weight <= 0:
+        await callback.answer(
+            "Сначала добавьте в оффер хотя бы один телефон, рубли или метеориты.",
+            show_alert=True,
+        )
+        return
+
+    await db.set_trade_status(trade_id, "awaiting_recipient_username")
+    await db.set_trade_awaiting(trade_id, None)
+    await callback.message.edit_text(
+        "✏️ Ответьте на любое сообщение бота и напишите @username игрока, "
+        "которому хотите предложить обмен.\n\n"
+        "Игрок должен хотя бы раз писать этому боту."
+    )
+    await callback.answer()
+
+
+async def apply_trade_recipient_username(message: Message, trade):
+    raw = message.text.strip().lstrip("@")
+    if not raw:
+        await message.reply("Напишите @username получателя.")
+        return
+
+    initiator_id = trade["initiator_id"]
+    target = await db.get_user_by_username(raw)
+    if target is None:
+        await message.reply(
+            "❌ Такой игрок не найден среди тех, кто писал боту. "
+            "Проверьте ник и попробуйте ещё раз (ответьте на это же сообщение)."
+        )
+        return
+    if target["user_id"] == initiator_id:
+        await message.reply("❌ Нельзя предложить трейд самому себе.")
+        return
+
+    await db.set_trade_recipient(trade["id"], target["user_id"])
+    await db.set_trade_status(trade["id"], "sent_to_recipient")
+
+    recipient_name = await trade_display_name(target["user_id"])
+    await message.reply(f"✅ Предложение трейда отправлено {recipient_name}.")
+
+    initiator_name = await trade_display_name(initiator_id)
+    updated_trade = await db.get_trade(trade["id"])
+    summary = await build_trade_summary_text(updated_trade, "initiator")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Открыть трейд", callback_data=f"trade_open:{trade['id']}")
+    kb.button(text="❌ Отклонить", callback_data=f"trade_decline:{trade['id']}")
+    kb.adjust(1)
+
+    try:
+        await bot.send_message(
+            target["user_id"],
+            f"🔄 Игрок {initiator_name} предлагает вам трейд!\n\n{summary}",
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить предложение трейда {target['user_id']}: {e}")
+        await message.answer(
+            "⚠️ Не получилось отправить предложение этому игроку в личные сообщения "
+            "(возможно, он не запускал бота в личке). Трейд остаётся открытым, "
+            "попросите его написать боту /start, а затем начните трейд заново."
+        )
+
+
+@dp.callback_query(F.data.startswith("trade_open:"))
+async def cb_trade_open(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    if (trade is None or trade["recipient_id"] != callback.from_user.id
+            or trade["status"] != "sent_to_recipient"):
+        await callback.answer("Это предложение уже недействительно.", show_alert=True)
+        return
+
+    await db.set_trade_status(trade_id, "building_recipient")
+    trade = await db.get_trade(trade_id)
+    await edit_trade_menu(callback, trade, "recipient")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("trade_decline:"))
+async def cb_trade_decline(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    if (trade is None or trade["recipient_id"] != callback.from_user.id
+            or trade["status"] != "sent_to_recipient"):
+        await callback.answer("Это предложение уже недействительно.", show_alert=True)
+        return
+
+    await db.cancel_trade(trade_id, status="declined")
+    await callback.message.edit_text("❌ Вы отклонили предложение трейда.")
+    await callback.answer()
+
+    try:
+        await bot.send_message(trade["initiator_id"], "❌ Игрок отклонил ваше предложение трейда.")
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить {trade['initiator_id']} об отклонении трейда: {e}")
+
+
+@dp.callback_query(F.data.startswith("trade_cancel:"))
+async def cb_trade_cancel(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    side = await get_trade_side_for_user(trade, callback.from_user.id)
+    if trade is None or side is None or trade["status"] in db.TRADE_TERMINAL_STATUSES:
+        await callback.answer("Этот трейд уже недоступен.", show_alert=True)
+        return
+
+    await db.cancel_trade(trade_id)
+    await callback.message.edit_text("❌ Трейд отменён.")
+    await callback.answer()
+
+    other_id = trade["recipient_id"] if side == "initiator" else trade["initiator_id"]
+    if other_id is not None:
+        try:
+            await bot.send_message(other_id, "❌ Собеседник отменил трейд.")
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить {other_id} об отмене трейда: {e}")
+
+
+@dp.callback_query(F.data.startswith("trade_confirm:"))
+async def cb_trade_confirm(callback: CallbackQuery):
+    trade_id = int(callback.data.split(":", 1)[1])
+    trade = await db.get_trade(trade_id)
+    if (trade is None or trade["recipient_id"] != callback.from_user.id
+            or trade["status"] != "building_recipient"):
+        await callback.answer("Этот трейд сейчас недоступен.", show_alert=True)
+        return
+
+    weight_initiator = await calc_trade_side_weight(trade, "initiator")
+    weight_recipient = await calc_trade_side_weight(trade, "recipient")
+
+    if weight_initiator <= 0 or weight_recipient <= 0:
+        await callback.answer(
+            "Обе стороны должны добавить в трейд хотя бы что-то "
+            "(телефон, рубли или метеориты).",
+            show_alert=True,
+        )
+        return
+
+    bigger = max(weight_initiator, weight_recipient)
+    smaller = min(weight_initiator, weight_recipient)
+    if smaller * TRADE_MIN_RATIO < bigger:
+        await callback.answer(
+            f"❌ Обмен слишком неравноценный: меньшая сторона весит {smaller}, "
+            f"большая — {bigger}. Меньшая сторона должна весить минимум половину "
+            f"от большей. Добавьте ещё в свой оффер.",
+            show_alert=True,
+        )
+        return
+
+    # Финальная проверка средств — за время сборки трейда баланс/метеориты
+    # могли измениться (например, что-то потрачено в другом месте бота)
+    initiator_balance = await db.get_balance(trade["initiator_id"])
+    recipient_balance = await db.get_balance(trade["recipient_id"])
+    initiator_meteorites = await db.get_meteorites(trade["initiator_id"])
+    recipient_meteorites = await db.get_meteorites(trade["recipient_id"])
+
+    if (trade["initiator_rub"] > initiator_balance
+            or trade["recipient_rub"] > recipient_balance
+            or trade["initiator_meteorites"] > initiator_meteorites
+            or trade["recipient_meteorites"] > recipient_meteorites):
+        await db.cancel_trade(trade_id)
+        await callback.answer(
+            "❌ У одной из сторон не хватает валюты, заявленной в трейде "
+            "(баланс изменился). Трейд отменён.",
+            show_alert=True,
+        )
+        try:
+            await bot.send_message(
+                trade["initiator_id"],
+                "❌ Трейд отменён: одной из сторон не хватило валюты для завершения.",
+            )
+        except Exception:
+            pass
+        return
+
+    await db.execute_trade(trade_id)
+
+    reputation_gain = calc_trade_reputation(weight_initiator, weight_recipient)
+    await db.add_reputation(trade["initiator_id"], reputation_gain)
+    await db.add_reputation(trade["recipient_id"], reputation_gain)
+
+    initiator_name = await trade_display_name(trade["initiator_id"])
+    recipient_name = await trade_display_name(trade["recipient_id"])
+
+    await callback.message.edit_text(
+        f"✅ Трейд успешно завершён с {initiator_name}!\n"
+        f"⚖️ Веса сторон: {weight_initiator} ⇄ {weight_recipient}\n"
+        f"⭐ Репутация +{reputation_gain:.2f}"
+    )
+    await callback.answer()
+
+    try:
+        await bot.send_message(
+            trade["initiator_id"],
+            f"✅ Трейд с {recipient_name} успешно завершён!\n"
+            f"⚖️ Веса сторон: {weight_initiator} ⇄ {weight_recipient}\n"
+            f"⭐ Репутация +{reputation_gain:.2f}",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить {trade['initiator_id']} о завершении трейда: {e}")
+
+
 PUBLIC_COMMANDS = [
     BotCommand(command="start", description="Помощь и информация о боте"),
     BotCommand(command="tel", description="Получить случайный телефон (аналог слова «тел»)"),
@@ -1103,6 +1764,9 @@ PUBLIC_COMMANDS = [
     BotCommand(command="profile", description="Профиль (аналог фразы «мой акк»)"),
     BotCommand(command="promo", description="Активировать промокод"),
     BotCommand(command="ref", description="Получить реферальную ссылку"),
+    BotCommand(command="trade", description="Предложить трейд (аналог слова «трейд»)"),
+    BotCommand(command="canceltrade", description="Отменить свой активный трейд"),
+    BotCommand(command="top", description="Топы игроков по балансу и цене инвентаря"),
 ]
 
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -1200,10 +1864,11 @@ async def event_scheduler():
 
 
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, BOT_ID
     await db.init_db()
     me = await bot.get_me()
     BOT_USERNAME = me.username
+    BOT_ID = me.id
     await setup_commands()
     await asyncio.gather(
         run_web_server(),

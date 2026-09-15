@@ -174,6 +174,34 @@ async def init_db():
             "BOOLEAN NOT NULL DEFAULT FALSE"
         )
 
+        # ---------- ТРЕЙДЫ ----------
+        # awaiting_input: 'rub' | 'meteor' | NULL — что сейчас вводит текущий
+        # "строящий" оффер игрок (кто именно — определяется по статусу:
+        # building_initiator -> инициатор, building_recipient -> получатель).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                initiator_id BIGINT NOT NULL,
+                recipient_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'building_initiator',
+                initiator_rub INTEGER NOT NULL DEFAULT 0,
+                initiator_meteorites INTEGER NOT NULL DEFAULT 0,
+                recipient_rub INTEGER NOT NULL DEFAULT 0,
+                recipient_meteorites INTEGER NOT NULL DEFAULT 0,
+                awaiting_input TEXT,
+                created_at DOUBLE PRECISION NOT NULL,
+                updated_at DOUBLE PRECISION NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_items (
+                id SERIAL PRIMARY KEY,
+                trade_id INTEGER NOT NULL REFERENCES trades(id),
+                side TEXT NOT NULL,
+                up_id INTEGER NOT NULL
+            )
+        """)
+
 
 # ---------- ТЕЛЕФОНЫ ----------
 
@@ -531,6 +559,30 @@ async def get_inventory_rank(user_id: int) -> int:
         return row["rn"] if row else 1
 
 
+async def get_top_balance(limit: int = 10):
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT user_id, username, balance FROM users "
+            "ORDER BY balance DESC, user_id ASC LIMIT $1",
+            limit,
+        )
+
+
+async def get_top_inventory(limit: int = 10):
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT u.user_id, u.username, COALESCE(SUM(up.price), 0) AS inventory_value
+            FROM users u
+            LEFT JOIN user_phones up ON up.user_id = u.user_id
+            GROUP BY u.user_id, u.username
+            ORDER BY inventory_value DESC, u.user_id ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+
 async def get_promo_used_count(user_id: int) -> int:
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -716,3 +768,186 @@ async def update_tester_probation(user_id: int, probation: bool) -> bool:
             "UPDATE users SET tester_probation = $1 WHERE user_id = $2", probation, user_id
         )
         return True
+
+
+# ---------- ТРЕЙДЫ ----------
+
+TRADE_TERMINAL_STATUSES = ("completed", "cancelled", "declined")
+
+
+async def get_user_by_username(username: str):
+    """Поиск без учёта регистра и '@'. Так как username в users хранится
+    "сырым" (без @) и обновляется при каждом ensure_user, берём самую
+    свежую запись на случай коллизии (два разных игрока владели одним
+    ником в разное время)."""
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE username ILIKE $1 ORDER BY user_id DESC LIMIT 1",
+            username.lstrip("@"),
+        )
+
+
+async def create_trade(initiator_id: int) -> int:
+    now = time.time()
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO trades (initiator_id, status, created_at, updated_at) "
+            "VALUES ($1, 'building_initiator', $2, $2) RETURNING id",
+            initiator_id, now,
+        )
+        return row["id"]
+
+
+async def get_trade(trade_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM trades WHERE id = $1", trade_id)
+
+
+async def get_active_trade_for_user(user_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM trades WHERE (initiator_id = $1 OR recipient_id = $1) "
+            "AND status NOT IN ('completed', 'cancelled', 'declined') "
+            "ORDER BY id DESC LIMIT 1",
+            user_id,
+        )
+
+
+async def set_trade_status(trade_id: int, status: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE trades SET status = $1, updated_at = $2 WHERE id = $3",
+            status, time.time(), trade_id,
+        )
+
+
+async def set_trade_recipient(trade_id: int, recipient_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE trades SET recipient_id = $1, updated_at = $2 WHERE id = $3",
+            recipient_id, time.time(), trade_id,
+        )
+
+
+async def set_trade_awaiting(trade_id: int, awaiting_input: str | None):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE trades SET awaiting_input = $1, updated_at = $2 WHERE id = $3",
+            awaiting_input, time.time(), trade_id,
+        )
+
+
+async def add_trade_currency(trade_id: int, side: str, rub: int = 0, meteorites: int = 0):
+    rub_col = "initiator_rub" if side == "initiator" else "recipient_rub"
+    met_col = "initiator_meteorites" if side == "initiator" else "recipient_meteorites"
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE trades SET {rub_col} = {rub_col} + $1, {met_col} = {met_col} + $2, "
+            f"updated_at = $3 WHERE id = $4",
+            rub, meteorites, time.time(), trade_id,
+        )
+
+
+async def get_trade_item_up_ids(trade_id: int, side: str) -> set:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT up_id FROM trade_items WHERE trade_id = $1 AND side = $2",
+            trade_id, side,
+        )
+        return {r["up_id"] for r in rows}
+
+
+async def add_trade_item(trade_id: int, side: str, up_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO trade_items (trade_id, side, up_id) VALUES ($1, $2, $3)",
+            trade_id, side, up_id,
+        )
+
+
+async def remove_trade_item(trade_id: int, side: str, up_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM trade_items WHERE trade_id = $1 AND side = $2 AND up_id = $3",
+            trade_id, side, up_id,
+        )
+
+
+async def get_trade_items_detailed(trade_id: int, side: str):
+    """Телефоны стороны трейда с деталями (для отображения и подсчёта веса)."""
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT ti.up_id, up.status, up.price, up.rank, "
+            "COALESCE(up.rarity, p.rarity) AS rarity, "
+            "COALESCE(p.model, 'Модель удалена из каталога') AS model "
+            "FROM trade_items ti "
+            "JOIN user_phones up ON up.id = ti.up_id "
+            "LEFT JOIN phones p ON p.id = up.phone_id "
+            "WHERE ti.trade_id = $1 AND ti.side = $2 "
+            "ORDER BY ti.id",
+            trade_id, side,
+        )
+
+
+async def is_up_id_in_other_active_trade(up_id: int, trade_id: int) -> bool:
+    """Не даёт добавить в оффер телефон, который уже участвует в ДРУГОМ
+    активном трейде."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM trade_items ti JOIN trades t ON t.id = ti.trade_id "
+            "WHERE ti.up_id = $1 AND ti.trade_id != $2 "
+            "AND t.status NOT IN ('completed', 'cancelled', 'declined')",
+            up_id, trade_id,
+        )
+        return row is not None
+
+
+async def cancel_trade(trade_id: int, status: str = "cancelled"):
+    await set_trade_status(trade_id, status)
+
+
+async def execute_trade(trade_id: int):
+    """Переставляет владельцев телефонов и переводит валюту одной
+    транзакцией. Вызывающий код обязан заранее убедиться, что у обеих
+    сторон хватает баланса/метеоритов — здесь этого уже не проверяем."""
+    trade = await get_trade(trade_id)
+    initiator_items = await get_trade_item_up_ids(trade_id, "initiator")
+    recipient_items = await get_trade_item_up_ids(trade_id, "recipient")
+
+    net_rub_for_initiator = trade["recipient_rub"] - trade["initiator_rub"]
+    net_met_for_initiator = trade["recipient_meteorites"] - trade["initiator_meteorites"]
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            for up_id in initiator_items:
+                await conn.execute(
+                    "UPDATE user_phones SET user_id = $1 WHERE id = $2",
+                    trade["recipient_id"], up_id,
+                )
+            for up_id in recipient_items:
+                await conn.execute(
+                    "UPDATE user_phones SET user_id = $1 WHERE id = $2",
+                    trade["initiator_id"], up_id,
+                )
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1, meteorites = meteorites + $2 "
+                "WHERE user_id = $3",
+                net_rub_for_initiator, net_met_for_initiator, trade["initiator_id"],
+            )
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1, meteorites = meteorites + $2 "
+                "WHERE user_id = $3",
+                -net_rub_for_initiator, -net_met_for_initiator, trade["recipient_id"],
+            )
+            await conn.execute(
+                "UPDATE trades SET status = 'completed', updated_at = $1 WHERE id = $2",
+                time.time(), trade_id,
+            )
+
+
+async def add_reputation(user_id: int, amount: float):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET reputation = reputation + $1 WHERE user_id = $2",
+            amount, user_id,
+        )
